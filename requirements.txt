@@ -1,4 +1,4 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-phonenumbers==8.13.26
-pydantic==2.5.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+phonenumbers==8.13.50
+pydantic==2.10.5
