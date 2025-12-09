@@ -1,10 +1,20 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import phonenumbers
 from phonenumbers import geocoder, carrier, number_type, PhoneNumberType
 import re
 
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class PhoneRequest(BaseModel):
     number: str
@@ -14,23 +24,38 @@ class PhoneRequest(BaseModel):
 
 def clean_phone_number(number: str) -> str:
     """Remove formatting but keep + prefix"""
-    # Remove spaces, dashes, parentheses, dots, but keep +
     cleaned = re.sub(r'[\s\-\(\)\.]', '', number)
     return cleaned
 
 
 def smart_parse_number(raw_number: str, default_region: str):
     """
-    Try multiple parsing strategies:
-    1. Parse as-is (works if + prefix exists)
-    2. Parse with default region (treats as domestic)
-    3. Try adding + prefix (detects international without +)
+    Intelligent parsing with multiple strategies including auto-country detection
     """
-    strategies = [
-        ("as_is", raw_number, None),
-        ("with_region", raw_number, default_region),
-        ("with_plus", f"+{raw_number}", None),
-    ]
+    strategies = []
+    
+    # Strategy 1: Parse as-is (if has + or clear format)
+    strategies.append(("as_is", raw_number, None))
+    
+    # Strategy 2: With default region (domestic)
+    if not raw_number.startswith('+'):
+        strategies.append(("with_region", raw_number, default_region))
+    
+    # Strategy 3: Add + prefix
+    if not raw_number.startswith('+'):
+        strategies.append(("with_plus", f"+{raw_number}", None))
+    
+    # Strategy 4: Try common countries for long numbers (10+ digits without +)
+    if len(raw_number) >= 10 and not raw_number.startswith('+'):
+        common_countries = [
+            'US', 'GB', 'MX', 'BR', 'AU', 'CA', 'DE', 'FR', 'IT', 'ES',
+            'AR', 'CO', 'PE', 'CL', 'CN', 'JP', 'KR', 'ID', 'TH', 'PH',
+            'MY', 'SG', 'VN', 'PK', 'BD', 'RU', 'TR', 'SA', 'AE', 'ZA'
+        ]
+        
+        for country in common_countries:
+            if country != default_region:  # Skip if already tried
+                strategies.append((f"auto_{country}", raw_number, country))
     
     results = []
     
@@ -39,25 +64,33 @@ def smart_parse_number(raw_number: str, default_region: str):
             parsed = phonenumbers.parse(number, region)
             is_valid = phonenumbers.is_valid_number(parsed)
             is_possible = phonenumbers.is_possible_number(parsed)
+            detected_region = phonenumbers.region_code_for_number(parsed)
             
             results.append({
                 "strategy": strategy_name,
                 "parsed": parsed,
                 "valid": is_valid,
                 "possible": is_possible,
-                "region": phonenumbers.region_code_for_number(parsed)
+                "region": detected_region
             })
+            
+            # If found valid result with priority strategies, return immediately
+            if is_valid and strategy_name in ["as_is", "with_plus"]:
+                return results[-1]
+                
         except:
             continue
     
-    # Priority: valid > possible > any parse
+    # Return best result: valid > possible > any
     valid_results = [r for r in results if r["valid"]]
     if valid_results:
-        # If multiple valid, prefer domestic first, then original format
+        # Prefer exact matches first
         for strategy in ["with_region", "as_is", "with_plus"]:
             match = next((r for r in valid_results if r["strategy"] == strategy), None)
             if match:
                 return match
+        # Return first valid from auto-detection
+        return valid_results[0]
     
     possible_results = [r for r in results if r["possible"]]
     if possible_results:
@@ -96,7 +129,6 @@ def validate_phone(data: PhoneRequest):
         "parse_strategy": None
     }
 
-    # Smart parsing
     parse_result = smart_parse_number(raw, region_hint)
     
     if not parse_result:
@@ -112,7 +144,6 @@ def validate_phone(data: PhoneRequest):
         result["reason"] = f"Invalid number (tried: {parse_result['strategy']})"
         return result
 
-    # ===== FORMATTING =====
     result["formatted_e164"] = phonenumbers.format_number(
         parsed, phonenumbers.PhoneNumberFormat.E164
     )
@@ -123,16 +154,13 @@ def validate_phone(data: PhoneRequest):
         parsed, phonenumbers.PhoneNumberFormat.NATIONAL
     )
 
-    # ===== COUNTRY INFO =====
     result["country_code"] = f"+{parsed.country_code}"
     result["region"] = phonenumbers.region_code_for_number(parsed)
     result["location"] = geocoder.description_for_number(parsed, "en")
 
-    # ===== DOMESTIC vs INTERNATIONAL =====
     result["is_domestic"] = result["region"] == home_country
     result["is_international"] = result["region"] != home_country
 
-    # ===== NUMBER TYPE =====
     num_type = number_type(parsed)
     
     type_map = {
@@ -157,14 +185,12 @@ def validate_phone(data: PhoneRequest):
         PhoneNumberType.FIXED_LINE_OR_MOBILE
     ]
 
-    # ===== CARRIER INFO =====
     try:
         carrier_name = carrier.name_for_number(parsed, "en")
         result["carrier"] = carrier_name if carrier_name else None
     except:
         result["carrier"] = None
 
-    # Reason message
     if result["is_domestic"]:
         result["reason"] = "Valid domestic number"
     else:
@@ -173,7 +199,6 @@ def validate_phone(data: PhoneRequest):
     return result
 
 
-# ===== BATCH VALIDATION =====
 class BatchPhoneRequest(BaseModel):
     numbers: list[str]
     default_region: str = "IN"
@@ -205,7 +230,6 @@ def validate_batch(data: BatchPhoneRequest):
     }
 
 
-# ===== HEALTH CHECK =====
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "Phone Validator API"}
